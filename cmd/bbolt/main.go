@@ -443,10 +443,10 @@ func newPageItemCommand(m *Main) *pageItemCommand {
 }
 
 type pageItemOptions struct {
+	format    string
 	help      bool
 	keyOnly   bool
 	valueOnly bool
-	format    string
 }
 
 // Run executes the command.
@@ -1499,21 +1499,21 @@ func (cmd *benchCommand) stopProfiling() {
 
 // BenchOptions represents the set of options that can be passed to "bolt bench".
 type BenchOptions struct {
-	ProfileMode   string
+	CPUProfile    string
 	WriteMode     string
 	ReadMode      string
-	Iterations    int64
-	BatchSize     int64
-	KeySize       int
-	ValueSize     int
-	CPUProfile    string
-	MemProfile    string
+	ProfileMode   string
+	Path          string
 	BlockProfile  string
+	MemProfile    string
+	Iterations    int64
+	ValueSize     int
+	KeySize       int
 	StatsInterval time.Duration
 	FillPercent   float64
+	BatchSize     int64
 	NoSync        bool
 	Work          bool
-	Path          string
 }
 
 // BenchResults represents the performance results of the benchmark and is thread-safe.
@@ -1556,8 +1556,8 @@ func (r *BenchResults) OpsPerSecond() int {
 }
 
 type PageError struct {
-	ID  int
 	Err error
+	ID  int
 }
 
 func (e *PageError) Error() string {

@@ -21,11 +21,85 @@ const flockRetryTimeout = 50 * time.Millisecond
 // All data access is performed through transactions which can be obtained through the DB.
 // All the functions on DB will return a ErrDatabaseNotOpen if accessed before Open() is called.
 type DB struct {
-	// When enabled, the database will perform a Check() after every commit.
-	// A panic is issued if the database is in an inconsistent state. This
-	// flag has a large performance impact so it should only be used for
-	// debugging purposes.
-	StrictMode bool
+	pagePool sync.Pool
+
+	meta0 *common.Meta
+
+	ops struct {
+		writeAt func(b []byte, off int64) (n int, err error)
+	}
+
+	file  *os.File
+	batch *batch
+
+	freelist *freelist
+	meta1    *common.Meta
+	openFile func(string, int, os.FileMode) (*os.File, error)
+	data     *[maxMapSize]byte
+	rwtx     *Tx
+
+	path string
+
+	// FreelistType sets the backend freelist type. There are two options. Array which is simple but endures
+	// dramatic performance degradation if database is large and fragmentation in freelist is common.
+	// The alternative one is using hashmap, it is faster in almost all circumstances
+	// but it doesn't guarantee that it offers the smallest page id available. In normal case it is safe.
+	// The default type is array
+	FreelistType common.FreelistType
+
+	txs []*Tx
+	// `dataref` isn't used at all on Windows, and the golangci-lint
+	// always fails on Windows platform.
+	//nolint
+	dataref []byte // mmap'ed readonly, write throws SEGV
+	stats   Stats
+
+	// MaxBatchDelay is the maximum delay before a batch starts.
+	// Default value is copied from DefaultMaxBatchDelay in Open.
+	//
+	// If <=0, effectively disables batching.
+	//
+	// Do not change concurrently with calls to Batch.
+	MaxBatchDelay time.Duration
+
+	datasz int
+
+	// If you want to read the entire database fast, you can set MmapFlag to
+	// syscall.MAP_POPULATE on Linux 2.6.23+ for sequential read-ahead.
+	MmapFlags int
+
+	pageSize int
+
+	// AllocSize is the amount of space allocated when the database
+	// needs to create new pages. This is done to amortize the cost
+	// of truncate() and fsync() when growing the data file.
+	AllocSize int
+
+	// MaxBatchSize is the maximum size of a batch. Default value is
+	// copied from DefaultMaxBatchSize in Open.
+	//
+	// If <=0, disables batching.
+	//
+	// Do not change concurrently with calls to Batch.
+	MaxBatchSize int
+
+	filesz   int          // current on disk file size
+	mmaplock sync.RWMutex // Protects mmap access during remapping.
+	statlock sync.RWMutex // Protects stats access.
+
+	freelistLoad sync.Once
+
+	metalock sync.Mutex // Protects meta page access.
+
+	rwlock sync.Mutex // Allows only one writer at a time.
+
+	batchMu sync.Mutex
+
+	// Mlock locks database file in memory when set to true.
+	// It prevents major page faults, however used memory can't be reclaimed.
+	//
+	// Supported only on Unix via mlock/munlock syscalls.
+	Mlock bool
 
 	// Setting the NoSync flag will cause the database to skip fsync()
 	// calls after each commit. This can be useful when bulk loading data
@@ -39,17 +113,7 @@ type DB struct {
 	// THIS IS UNSAFE. PLEASE USE WITH CAUTION.
 	NoSync bool
 
-	// When true, skips syncing freelist to disk. This improves the database
-	// write performance under normal operation, but requires a full database
-	// re-sync during recovery.
-	NoFreelistSync bool
-
-	// FreelistType sets the backend freelist type. There are two options. Array which is simple but endures
-	// dramatic performance degradation if database is large and fragmentation in freelist is common.
-	// The alternative one is using hashmap, it is faster in almost all circumstances
-	// but it doesn't guarantee that it offers the smallest page id available. In normal case it is safe.
-	// The default type is array
-	FreelistType common.FreelistType
+	opened bool
 
 	// When true, skips the truncate call when growing the database.
 	// Setting this to true is only safe on non-ext3/ext4 systems.
@@ -59,76 +123,21 @@ type DB struct {
 	// https://github.com/boltdb/bolt/issues/284
 	NoGrowSync bool
 
+	// When true, skips syncing freelist to disk. This improves the database
+	// write performance under normal operation, but requires a full database
+	// re-sync during recovery.
+	NoFreelistSync bool
+
 	// When `true`, bbolt will always load the free pages when opening the DB.
 	// When opening db in write mode, this flag will always automatically
 	// set to `true`.
 	PreLoadFreelist bool
 
-	// If you want to read the entire database fast, you can set MmapFlag to
-	// syscall.MAP_POPULATE on Linux 2.6.23+ for sequential read-ahead.
-	MmapFlags int
-
-	// MaxBatchSize is the maximum size of a batch. Default value is
-	// copied from DefaultMaxBatchSize in Open.
-	//
-	// If <=0, disables batching.
-	//
-	// Do not change concurrently with calls to Batch.
-	MaxBatchSize int
-
-	// MaxBatchDelay is the maximum delay before a batch starts.
-	// Default value is copied from DefaultMaxBatchDelay in Open.
-	//
-	// If <=0, effectively disables batching.
-	//
-	// Do not change concurrently with calls to Batch.
-	MaxBatchDelay time.Duration
-
-	// AllocSize is the amount of space allocated when the database
-	// needs to create new pages. This is done to amortize the cost
-	// of truncate() and fsync() when growing the data file.
-	AllocSize int
-
-	// Mlock locks database file in memory when set to true.
-	// It prevents major page faults, however used memory can't be reclaimed.
-	//
-	// Supported only on Unix via mlock/munlock syscalls.
-	Mlock bool
-
-	path     string
-	openFile func(string, int, os.FileMode) (*os.File, error)
-	file     *os.File
-	// `dataref` isn't used at all on Windows, and the golangci-lint
-	// always fails on Windows platform.
-	//nolint
-	dataref  []byte // mmap'ed readonly, write throws SEGV
-	data     *[maxMapSize]byte
-	datasz   int
-	filesz   int // current on disk file size
-	meta0    *common.Meta
-	meta1    *common.Meta
-	pageSize int
-	opened   bool
-	rwtx     *Tx
-	txs      []*Tx
-	stats    Stats
-
-	freelist     *freelist
-	freelistLoad sync.Once
-
-	pagePool sync.Pool
-
-	batchMu sync.Mutex
-	batch   *batch
-
-	rwlock   sync.Mutex   // Allows only one writer at a time.
-	metalock sync.Mutex   // Protects meta page access.
-	mmaplock sync.RWMutex // Protects mmap access during remapping.
-	statlock sync.RWMutex // Protects stats access.
-
-	ops struct {
-		writeAt func(b []byte, off int64) (n int, err error)
-	}
+	// When enabled, the database will perform a Check() after every commit.
+	// A panic is issued if the database is in an inconsistent state. This
+	// flag has a large performance impact so it should only be used for
+	// debugging purposes.
+	StrictMode bool
 
 	// Read only mode.
 	// When true, Update() and Begin(true) return ErrDatabaseReadOnly immediately.
@@ -933,8 +942,8 @@ type call struct {
 type batch struct {
 	db    *DB
 	timer *time.Timer
-	start sync.Once
 	calls []call
+	start sync.Once
 }
 
 // trigger runs the batch if it hasn't already been run.
@@ -1179,22 +1188,10 @@ func (db *DB) freepages() []common.Pgid {
 
 // Options represents the options that can be set when opening a database.
 type Options struct {
-	// Timeout is the amount of time to wait to obtain a file lock.
-	// When set to zero it will wait indefinitely. This option is only
-	// available on Darwin and Linux.
-	Timeout time.Duration
 
-	// Sets the DB.NoGrowSync flag before memory mapping the file.
-	NoGrowSync bool
-
-	// Do not sync freelist to disk. This improves the database write performance
-	// under normal operation, but requires a full database re-sync during recovery.
-	NoFreelistSync bool
-
-	// PreLoadFreelist sets whether to load the free pages when opening
-	// the db file. Note when opening db in write mode, bbolt will always
-	// load the free pages.
-	PreLoadFreelist bool
+	// OpenFile is used to open files. It defaults to os.OpenFile. This option
+	// is useful for writing hermetic tests.
+	OpenFile func(string, int, os.FileMode) (*os.File, error)
 
 	// FreelistType sets the backend freelist type. There are two options. Array which is simple but endures
 	// dramatic performance degradation if database is large and fragmentation in freelist is common.
@@ -1203,9 +1200,10 @@ type Options struct {
 	// The default type is array
 	FreelistType common.FreelistType
 
-	// Open database in read-only mode. Uses flock(..., LOCK_SH |LOCK_NB) to
-	// grab a shared lock (UNIX).
-	ReadOnly bool
+	// Timeout is the amount of time to wait to obtain a file lock.
+	// When set to zero it will wait indefinitely. This option is only
+	// available on Darwin and Linux.
+	Timeout time.Duration
 
 	// Sets the DB.MmapFlags flag before memory mapping the file.
 	MmapFlags int
@@ -1223,14 +1221,26 @@ type Options struct {
 	// PageSize overrides the default OS page size.
 	PageSize int
 
+	// Sets the DB.NoGrowSync flag before memory mapping the file.
+	NoGrowSync bool
+
+	// Do not sync freelist to disk. This improves the database write performance
+	// under normal operation, but requires a full database re-sync during recovery.
+	NoFreelistSync bool
+
+	// PreLoadFreelist sets whether to load the free pages when opening
+	// the db file. Note when opening db in write mode, bbolt will always
+	// load the free pages.
+	PreLoadFreelist bool
+
+	// Open database in read-only mode. Uses flock(..., LOCK_SH |LOCK_NB) to
+	// grab a shared lock (UNIX).
+	ReadOnly bool
+
 	// NoSync sets the initial value of DB.NoSync. Normally this can just be
 	// set directly on the DB itself when returned from Open(), but this option
 	// is useful in APIs which expose Options but not the underlying DB.
 	NoSync bool
-
-	// OpenFile is used to open files. It defaults to os.OpenFile. This option
-	// is useful for writing hermetic tests.
-	OpenFile func(string, int, os.FileMode) (*os.File, error)
 
 	// Mlock locks database file in memory when set to true.
 	// It prevents potential page faults, however
